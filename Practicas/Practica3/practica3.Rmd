@@ -1,0 +1,472 @@
+---
+title: |
+  ![](C:\Users\power\Desktop\logo.jpg){width=4in}
+  
+  **Clasificación**
+  \bigskip
+author: "Carlos Morales Aguilera"
+date: |
+  28/11/2020
+  \pagebreak
+  
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("readxl")
+library(MASS)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(precrec)
+library(fastDummies)
+library(Boruta)
+library(randomForest)
+library(nnet)
+library(NeuralNetTools)
+library(e1071)
+library(class)
+set.seed(1234)
+```
+
+## Lectura de datos
+
+El primer paso en el problema es leer correctamente los datos, para ello se utiliza la función ```read_excel``` de la librería **readxl**, a continuación se transforma el conjunto de datos obtenido en una estructura del tipo **dataframe** propia de *R*.
+
+```{r}
+f <- "C:\\Users\\power\\Desktop\\TID\\practica3\\eBayAuctions.xls"
+# Read dataframe
+bd_eBay <- as.data.frame(read_excel(f))
+```
+
+Una de las buenas prácticas aprendidas de las prácticas anteriores es la de eliminar valores perdidos, por lo que previamente a tratar con los datos, nos aseguramos de eliminar los posibles valores perdidos si hubieran.
+
+```{r}
+# Omit NAs
+bd_eBay <- na.omit(bd_eBay)
+```
+
+Tras cargar los datos, visualizamos cuantas instancias hay de cada clase utilizando para ello la primera variable del conjunto de datos, referente a la competitividad de una subasta.
+
+```{r}
+# Group by class
+classes <- table(bd_eBay$`Competitive?`)
+classes
+
+```
+
+## Preprocesamiento de los datos
+
+El primer paso consiste en normalizar las variables númericas que posee el conjunto, para ello se emplea una normalización aplicando el algoritmo **Min-max**, para poder trabajar con los datos de forma adecuada.
+
+```{r}
+# Definition of min_max normalization function
+min_max_norm <- function(x) {
+    (x - min(x)) / (max(x) - min(x))
+}
+
+# Apply normalization to our dataframe
+bd_eBay$sellerRating <- min_max_norm(bd_eBay$sellerRating)
+bd_eBay$Duration <- min_max_norm(bd_eBay$Duration)
+bd_eBay$ClosePrice <- min_max_norm(bd_eBay$ClosePrice)
+bd_eBay$OpenPrice <- min_max_norm(bd_eBay$OpenPrice)
+
+```
+
+A continuación, se procede a evaluar los posibles *outliers* de las variables numéricas, para ello se realizan **boxplots** de las variables numéricas, y a continuación se evaluan los posibles *outliers* para determinar si son casos especiales o atípicos.
+
+```{r}
+# Boxplot OpenPrice
+boxplot(bd_eBay$OpenPrice)
+# Boxplot sellerRating
+boxplot(bd_eBay$sellerRating)
+# Boxplot ClosedPrice
+boxplot(bd_eBay$ClosePrice)
+```
+
+Tras analizar los posibles *outliers* visualizados, podemos observar que realmente se tratan de casos especiales, pero no se encuenta ningún valor que se pueda considerar realmente atípico en el contexto del problema, por lo que no se eliminará ninguno de los elementos.
+
+Una vez examinados los *outliers*, se procede a evaluar las variables categóricas, de cara a poder ser procesadas fácilmente por los siguientes modelos, por lo que se ha optado por hacer una transformación en [Dummy variables](https://en.wikipedia.org/wiki/Dummy_variable_(statistics)).
+
+Para ello se utiliza la función [dummy_cols](https://www.rdocumentation.org/packages/fastDummies/versions/0.1.2/topics/dummy_cols) del paquete [fastDummies](https://cran.r-project.org/web/packages/fastDummies/fastDummies.pdf), con el que las variables categóricas se convierten en variables *dummy*, por ejemplo, la variable **endDay** con valores (*Mon*, *Tue*, *Wed*, *Thu*, *Fri*, *Sat*, *Sun*) se convertirá en las siguientes variables: *endDay_Mon*, *endDay_Tue*, *endDay_Wed*, *endDay_Thu*, *endDay_Fri*, *endDay_Sat* y *endDay_Sun*, como factores de valores 0 y 1.
+
+**Nota**: Las variables catégoricas con un caracter */* son tratadas para suprimir dicho caracter, ya que en ciertos modelos se consideran nombres no permitidos de variables.
+
+```{r}
+# Create dummy variables for categorical variables
+bd_eBay <- dummy_cols(bd_eBay)
+
+# Remove categorical variables
+bd_eBay[, "Category"] <- NULL
+bd_eBay[, "currency"] <- NULL
+bd_eBay[, "endDay"] <- NULL
+
+# Get column names and convert to factors
+cols <- colnames(bd_eBay[,6:33])
+bd_eBay[cols] <- lapply(bd_eBay[cols], factor)
+
+# Get column names and erase '/' character
+cols <- colnames(bd_eBay)
+for(i in 1:length(cols)) cols[i] <- gsub("/", "", cols[i])
+
+# Set column names
+names(bd_eBay) <- cols
+```
+
+Una de las técnicas aprendidas previamente es la de selección de características, por lo que para ello se utilizan diversos métodos con el fin de detectar la importancia de las diferentes variables a tratar:
+
+* [Boruta](https://www.datacamp.com/community/tutorials/feature-selection-R-boruta), utilizando para ello una selección de variables significativas, teniendo en cuenta tentativas y confirmar si las variables deben permanecer en el modelo o pueden ser eliminadas, y recibiendo información sobre su importancia.
+
+* Entrenar un [modelo lineal](https://en.wikipedia.org/wiki/Linear_model) y observar que variables son necesarias para construir dicho modelo.
+
+Una vez analizados ambos resultados, se realizará un análisis y se decidirá que variables se han de eliminar.
+
+Para el modelo de **Boruta** se ha utilizado las funciones [Boruta](https://www.rdocumentation.org/packages/Boruta/versions/7.0.0/topics/Boruta), [getSelectedAttributes](https://www.rdocumentation.org/packages/Boruta/versions/5.2.0/topics/getSelectedAttributes), [TentativeRoughFix](https://www.rdocumentation.org/packages/Boruta/versions/7.0.0/topics/TentativeRoughFix) y [attStats](https://www.rdocumentation.org/packages/Boruta/versions/5.2.0/topics/attStats) del paquete [Boruta](https://cran.r-project.org/web/packages/Boruta/Boruta.pdf).
+
+Para ello entrenamos un modelo con **Boruta**, obteniendo los atributos seleccionados y realizando un arreglo para obtener las tentativas (si las hay). A continuación obtendremos de nuevos los atributos y mostramos finalmente la información obtenida.
+
+```{r, eval=FALSE}
+# Perform Boruta search
+boruta_output <- Boruta(`Competitive?`~., data = bd_eBay, doTrace=0)
+
+# Get significant variables including tentatives
+boruta_signif <- getSelectedAttributes(boruta_output, withTentative = TRUE)
+
+# Do a tentative rough fix
+roughFixMod <- TentativeRoughFix(boruta_output)
+boruta_signif <- getSelectedAttributes(roughFixMod)
+
+# Variable Importance Scores
+imps <- attStats(roughFixMod)
+imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')]
+
+# Print variable importance
+print(imps2[order(-imps2$meanImp), ])
+```
+
+Tras realizar el análisis con **Boruta**, se procede a realizar el **Modelo lineal**. Para ello se ha utilizado la función [stepAIC](https://www.rdocumentation.org/packages/MASS/versions/7.3-53/topics/stepAIC), la cual nos permite hacer distintos tipos de regresiones de características, pero en nuestro caso indicamos que realice de tipo *both* (*backward* y *forward*). Para ello primero entrenamos el modelo con un [modelo lineal](https://en.wikipedia.org/wiki/Linear_model) utilizando la función [lm](https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/lm).
+
+Una vez construido el modelo, se examinan las variables que se han utilizado para construir el modelo y cuales se pueden descartar para analizarlas junto al modelo de **Boruta**:
+
+```{r}
+# Train the linear model
+model <- lm(bd_eBay$`Competitive?`~., data = bd_eBay)
+# Get the stepwise regression model
+step.model <- stepAIC(model, direction = "both", trace = FALSE)
+# Get the model
+anova <- step.model$anova
+anova
+
+```
+
+Tras analizar los modelos, y las variables seleccionadas para su revisión, se decide eliminar las siguientes variables del conjunto de datos:
+
+```{r}
+bd_eBay[, "endDay_Wed"] <- NULL
+bd_eBay[, "endDay_Fri"] <- NULL
+bd_eBay[, "endDay_Sun"] <- NULL
+bd_eBay[, "currency_US"] <- NULL
+bd_eBay[, "currency_EUR"] <- NULL
+bd_eBay[, "Category_ToysHobbies"] <- NULL
+bd_eBay[, "Category_Computer"] <- NULL
+bd_eBay[, "Category_Collectibles"] <- NULL
+bd_eBay[, "Category_Photography"] <- NULL
+bd_eBay[, "Category_HomeGarden"] <- NULL
+bd_eBay[, "Category_BusinessIndustrial"] <- NULL
+bd_eBay[, "Category_AntiqueArtCraft"] <- NULL
+bd_eBay[, "Category_EverythingElse"] <- NULL
+```
+
+## Creación de grupos de entrenamiento y test
+
+Para comprobar que el modelo de árbol de decisión se realiza una [validación cruzada](https://es.wikipedia.org/wiki/Validaci%C3%B3n_cruzada), por lo que se necesitan dos conjuntos: *train* y *test*. El conjunto de entrenamiento comprenderá el 80% de los datos tomados para entrenar el árbol de decisión que clasifique el problema, y el conjunto de testeo se empleará para validad el modelo de ajuste obtenido.
+
+```{r}
+create_train_test <- function(data, size = 0.8, train = TRUE) {
+  n_row = nrow(data)
+  total_row = size * n_row
+  train_sample <- 1: total_row
+  if (train == TRUE) {
+    return (data[train_sample, ])
+  } else {
+    return (data[-train_sample, ])
+  }
+}
+```
+
+## Modelos de clasificación
+
+Para la realización de la práctica se ha decidido tomar diferentes modelos de clasificación y ver como estos son capaces de adaptarse a las condiciones del problema. Los modelos escogidos son:
+
+* Árboles de decisión, con la función [rpart](https://www.rdocumentation.org/packages/rpart/versions/4.1-15/topics/rpart).
+* Random Forest, con la función [randomForest](https://www.rdocumentation.org/packages/randomForest/versions/4.6-14/topics/randomForest).
+* Red Neuronal Artificial, con [nnet](https://www.rdocumentation.org/packages/nnet/versions/7.3-14/topics/nnet).
+* Naive Bayes, con [naiveBayes](https://www.rdocumentation.org/packages/e1071/versions/1.7-3/topics/naiveBayes).
+* K-Nearest Neighbour, con [knn](https://www.rdocumentation.org/packages/DMwR/versions/0.4.1/topics/kNN).
+
+Tras observar los resultados obtenidos, se estableceran una serie de conclusiones y se decidirá sobre los modelos obtenidos cuales son las mejores decisiones que podría tomar *eBay* de cara a sus posibles mejores. Todos estos modelos a su vez serán comprobados mediante matrices de confusión con la función [confusionMatrix](https://www.rdocumentation.org/packages/caret/versions/3.45/topics/confusionMatrix) de la librería [caret](http://topepo.github.io/caret/index.html) y mediante curvas ROC mediante la función [evalmod](https://www.rdocumentation.org/packages/precrec/versions/0.11.2/topics/evalmod) de la librería [prerec](https://cran.r-project.org/web/packages/precrec/precrec.pdf).
+
+## Árboles de decisión
+
+El primer modelo de clasificación escogido es el [árbol de decisión binario](https://es.wikipedia.org/wiki/Aprendizaje_basado_en_%C3%A1rboles_de_decisi%C3%B3n), el cual dado un conjunto de datos, divide este por características de forma que se tome una decisión o su opuesta, para clasificar. Se ha definido una función que solicita un conjunto de entrenamiento y realiza la clasificación en un árbol de decisión binario. Para ello se ha utilizado la librería [rpart](https://cran.r-project.org/web/packages/rpart/rpart.pdf), concretamente haciendo uso tanto de la función [rpart](https://www.rdocumentation.org/packages/rpart/versions/4.1-15/topics/rpart) como de su representación mediante [rpart.plot](https://www.rdocumentation.org/packages/rpart.plot/versions/3.0.9/topics/rpart.plot), perteneciente a la librería [rpart.plot](https://cran.r-project.org/web/packages/rpart.plot/rpart.plot.pdf).
+
+Además, se indica el parémtro ```cp=-1``` para que se explore el árbol entero, que aunque no se represente entero en el árbol dibujado, el modelo tendrá un mayor ajuste.
+
+
+```{r}
+# Set train and test data
+data_train <- create_train_test(bd_eBay, 0.8, train = TRUE)
+data_test <- create_train_test(bd_eBay, 0.8, train = FALSE)
+
+# Adjust the model
+fit <- rpart(`Competitive?`~., data = data_train, method = 'class', cp=-1)
+
+# Plot the model
+rpart.plot(fit)
+```
+
+Una vez realizado el modelo de árbol de decisión, se procede a estimar el grupo de test, crear la matrix de confusión y ver el *accuracy* obtenido:
+
+```{r}
+# Predict the test data class
+predicted_class <-predict(fit, data_test, type='class')
+
+# Create the confusion matrix
+matrix<-confusionMatrix(as.factor(data_test$`Competitive?`), predicted_class)
+dt_accuracy <- matrix$overall["Accuracy"]
+
+# Print confusion matrix
+matrix
+```
+
+A continuación se visualiza la curva ROC asociada al modelo de árbol de decisión:
+
+```{r}
+# We evaluate the ROC curve
+roc_curve <- evalmod(scores = as.numeric(predicted_class), labels = data_test$`Competitive?`)
+autoplot(roc_curve)
+```
+
+
+## Random Forest
+
+El siguiente modelo a observar se trata de [Random Forest](https://en.wikipedia.org/wiki/Random_forest#:~:text=Random%20forests%20or%20random%20decision,average%20prediction%20(regression)%20of%20the), el cual dado un conjunto de datos, divide este por características de forma que se tome una decisión o su opuesta, para clasificar, formando varios árboles de decisión con decisiones diferentes. Tras crear una seria de árboles de decisión, el algoritmo se encarga de realizar una votación entre los distintos árboles para obtener un modelo final. Para ello se ha utilizado la librería [randomForest](https://cran.r-project.org/web/packages/randomForest/randomForest.pdf), utilizando para ello la función [randomForest](https://www.rdocumentation.org/packages/randomForest/versions/4.6-14/topics/randomForest).
+
+Para la realización del modelo se escoge un total de 100 árboles de decisión (*ntree*), y se escoge 2 como número de variables seleccionadas aleatoriamente para la división (*mtry*), tras estudiar y probar diferentes configuraciones del modelo.
+
+
+Una vez realizado el modelo de Random Forest, se procede a estimar el grupo de test, crear la matrix de confusión y ver el *accuracy* obtenido:
+
+```{r}
+# Set train and test data
+data_train <- create_train_test(bd_eBay, 0.8, train = TRUE)
+data_test <- create_train_test(bd_eBay, 0.8, train = FALSE)
+
+
+# Adjust the model
+fit <- randomForest(as.factor(`Competitive?`)~., data = data_train, ntree=100, mtry=2)
+
+# Predict the test data class
+predicted_class <-predict(fit, data_test)
+
+# Create the confusion matrix
+matrix<-confusionMatrix(as.factor(data_test$`Competitive?`), predicted_class)
+rf_accuracy <- matrix$overall["Accuracy"]
+
+# Print confusion matrix
+matrix
+```
+
+A continuación se visualiza la curva ROC asociada al modelo de Random Forest:
+
+```{r}
+# We evaluate the ROC curve
+roc_curve <- evalmod(scores = as.numeric(predicted_class), labels = data_test$`Competitive?`)
+autoplot(roc_curve)
+```
+
+## Redes Neuronales
+
+El tercer modelo seleccionado es el de [Red Neuronal Articifial](https://es.wikipedia.org/wiki/Red_neuronal_artificial), el cual recibe un en las neuronas de entrada un conjunto de datos, que son procesados por las diferentes capas de neuronas ocultas (previamente configuradas) de la red, para obtener en la salida un modelo que a través del aprendizaje puede ajustarse mediante pesos al conjunto de datos.
+
+Para ello se ha utilizado la librería [nnet](https://cran.r-project.org/web/packages/nnet/nnet.pdf), empleando la función [nnet](https://www.rdocumentation.org/packages/nnet/versions/7.3-14/topics/nnet).
+
+Para la realización del modelo se han utilizado una serie de configuraciones distintas, y tras estudiar y analizar los resultados, y analizar el conjunto de datos, se han establecido los siguientes parámetros:
+
+* Número de capas ocultas: 2 (*size*).
+* Número máximo de iteraciones: 200 (*maxit*).
+* Permitir conexiones entre la entrada y la salida mediante el parámetro *skip*.
+
+Se han utilizado estos parámetros ya que un ajuste excesivo del modelo es incapaz de predecir correctamente el conjunto de datos y añade una complejidad excesiva, por lo que con una configuración de 2 capas de neuronas ocultas se pueden obtener unos buenos resultados, además de que el modelo llega a converger a las 1000 iteraciones, pero tras estudiarse, con unas 200 iteraciones es más que suficiente para obtener un resultado similar reduciendo en una quinta parte el número de iteraciones del algoritmo.
+
+Para visualizar la red neuronal se utiliza la función [plotnet](https://www.rdocumentation.org/packages/NeuralNetTools/versions/1.5.2/topics/plotnet) del paquete [NeuralNetTools](https://cran.r-project.org/web/packages/NeuralNetTools/index.html).
+
+```{r}
+
+# Set train and test data
+data_train <- create_train_test(bd_eBay, 0.8, train = TRUE)
+data_test <- create_train_test(bd_eBay, 0.8, train = FALSE)
+
+# Adjust the model
+nn=nnet(as.factor(`Competitive?`)~ ., data=data_train, size=2,  maxit=200, skip=TRUE) 
+
+
+# Plot the model
+plotnet(nn, pos_col="green", neg_col="red", max_sp=TRUE)
+```
+
+Una vez realizado el modelo de Red Neuronal Artificial, se procede a estimar el grupo de test, crear la matrix de confusión y ver el *accuracy* obtenido:
+
+```{r}
+# Predict the test data class
+predicted_class <-predict(fit, data_test)
+
+# Create the confusion matrix
+matrix<-confusionMatrix(as.factor(data_test$`Competitive?`), predicted_class)
+nn_accuracy <- matrix$overall["Accuracy"]
+
+# Print confusion matrix
+matrix
+```
+
+A continuación se visualiza la curva ROC asociada al modelo de Red Neuronal Artificial:
+
+```{r}
+# We evaluate the ROC curve
+roc_curve <- evalmod(scores = as.numeric(predicted_class), labels = data_test$`Competitive?`)
+autoplot(roc_curve)
+```
+
+## Naive Bayes
+
+El cuarto modelo seleccionado es el de [Naive Bayes](https://es.wikipedia.org/wiki/Clasificador_bayesiano_ingenuo), el cual asume que la presencia de una característica no es dependiente de la existencia de otra, permitiendo un entrenamiento del modelo mediante las frecuencias relativas de las características del conjunto de entrenamiento. Para ello crea un modelo que mezcla probabilidad y frecuencia, definiendo así las probabilidades de que se de una determinada clase a partir de sus características de forma independiente.
+
+Para ello se ha utilizado la librería [e1071](https://cran.r-project.org/web/packages/e1071/index.html), utilizando la función [naiveBayes](https://www.rdocumentation.org/packages/e1071/versions/1.7-3/topics/naiveBayes).
+
+A continuación se pueden observar las diferentes probabilidades individuales de cada característica:
+
+```{r}
+
+# Set train and test data
+data_train <- create_train_test(bd_eBay, 0.8, train = TRUE)
+data_test <- create_train_test(bd_eBay, 0.8, train = FALSE)
+
+# Adjust the model
+fit=naiveBayes(as.factor(`Competitive?`)~ ., data=data_train)
+
+# Print the model
+fit
+```
+
+
+Una vez realizado el modelo de Naive Bayes, se procede a estimar el grupo de test, crear la matrix de confusión y ver el *accuracy* obtenido:
+
+```{r}
+# Predict the test data class
+predicted_class <-predict(fit, data_test)
+
+# Create the confusion matrix
+matrix<-confusionMatrix(as.factor(data_test$`Competitive?`), predicted_class)
+nb_accuracy <- matrix$overall["Accuracy"]
+
+# Print confusion matrix
+matrix
+```
+
+A continuación se visualiza la curva ROC asociada al modelo de Naive Bayes:
+
+```{r}
+# We evaluate the ROC curve
+roc_curve <- evalmod(scores = as.numeric(predicted_class), labels = data_test$`Competitive?`)
+autoplot(roc_curve)
+```
+
+## KNN
+
+El último modelo seleccionado es el de [K-Nearest Neighbors](https://es.wikipedia.org/wiki/K_vecinos_m%C3%A1s_pr%C3%B3ximos), el cual dado un conjunto de entrada con diferentes clases, analiza si un elemento posee dentro de su rango más vecinos de una clase u otra, y clasifica en aquella clase en la que posea más vecinos dentro de un rango con *k* vecinos. Este modelo sigue una distribución espacial de los elementos.
+
+Para la realización de este modelo se ha hecho uso de la librería [class](https://cran.r-project.org/web/packages/class/class.pdf), concretamente de la función [knn](https://www.rdocumentation.org/packages/class/versions/7.3-17/topics/knn).
+
+Tras probar diferentes parámetros, y observar el tamaño del conjunto de datos, se ha tomado como valor ```k=20```, es decir, los 20 vecinos más cercanos.
+
+Una vez realizado el modelo de KNN, se procede a estimar el grupo de test, crear la matrix de confusión y ver el *accuracy* obtenido:
+
+```{r}
+# Extract train and test labels
+train.label <- data_train[, "Competitive?"]
+test.label <- data_test[, "Competitive?"]
+
+# Adjust the model
+predicted_class <- knn(data_train,data_test,cl=train.label,k=20)
+
+# Create the confusion matrix
+matrix<-confusionMatrix(as.factor(test.label), predicted_class)
+knn_accuracy <- matrix$overall["Accuracy"]
+
+# Print confusion matrix
+matrix
+```
+
+A continuación se visualiza la curva ROC asociada al modelo de KNN:
+
+```{r}
+# We evaluate the ROC curve
+roc_curve <- evalmod(scores = as.numeric(predicted_class), labels = test.label)
+autoplot(roc_curve)
+```
+
+
+
+## Comparativa Accuracy
+
+Tras realizar los diferentes modelos, se procede a visualizar una tabla comparativa del *accuracy* obtenido por los diferentes modelos:
+
+```{r}
+models_name <- c('Árbol de decisión', 'Random Forest', 'Red Neuronal Artificial', 'Naive Bayes', 'KNN')
+models_acc <- c(dt_accuracy, rf_accuracy, nn_accuracy, nb_accuracy, knn_accuracy)
+acc_table <- data.frame(models_name, models_acc)
+names(acc_table) <- c("Modelos", "Accuracy")
+
+acc_table
+```
+
+Por último, antes de presentar las conclusiones, se observa un resumen de la información final del conjunto tras los diferentes tratamientos para ambas clases:
+
+```{r}
+# Get both classes from the dataset
+for(i in 1:length(bd_eBay)) non_competitive_class <- bd_eBay[bd_eBay$`Competitive?` == 0, ]
+for(i in 1:length(bd_eBay)) competitive_class <- bd_eBay[bd_eBay$`Competitive?` == 1, ]
+
+summary(non_competitive_class)
+
+summary(competitive_class)
+```
+## Conclusiones
+
+Tras realizar el preprocesamiento, análisis del conjunto de datos, clasificación en distintos modelos, comparativa de modelos y análisis de resultados, se han llegado a las siguientes conclusiones:
+
+* Uno de los puntos complicados que se trató en la realización de la práctica fue el de selección de características, ya que al tratarse de variables categóricas, muchos modelos no podían realizarse o perdían bastante efectividad debido a estas variables, aunque se planteó una discretización, tras realizar estudio sobre diferentes opciones como normalización entre otras, se decidió utilizar una conversión en **Dummy variables** porque se considera que es la mejor forma de que la información que se representa siga manteniendo su significado sin que este se vea modificado. Tras este procedimiento se han realizado diversos modelos para elegir que características aportaban con mayor o menor importancia al modelo, y se ha decidido eliminar aquellas que si bien influyen, lo hacen en una medida ínfima, y generan más desconocimiento de lo que aportan realmente al problema.
+
+* Otra de las tareas más complicadas ha sido la realización de una selección de instancias, ya que en este problema una selección aleatoria no tiene sentido, ya que se pueden no considerar determinados casos de determinadas categorías de los productos o días de la semana. Se han realizado otros modelos y otros procedimientos de selección de instancias como [FRIS](https://ieeexplore.ieee.org/document/5584791), pero en este caso, aunque se obtenían instancias con mucha representatividad, se reducía demasiado el conjunto de datos, como para considerarse una selección representativa de todo el conjunto o fiable del mismo. Se obtenían mejores resultados, pero al extrapolar estos resultados al resto del conjunto inicial, se obtenía un empeoramiento, por lo que se ha descartado esta técnica para este problema.
+
+* Tras analizar los distintos modelos, se puede ver que realmente es un problema complejo de decidir realmente que características son las más importantes, aunque se puede observar que en los diferentes modelos se hace notable que las variables **closePrice**, **openPrice** y **sellerRating** son las más representativas del conjunto, y realizando un análisis del conjunto de datos, es un planteamiento coherente.
+
+* No es de extrañar que el algoritmo con mejores resultados sea **KNN**, ya que se basa en una distribución espacial de características, por lo que subastas con elementos similares realmente serán clasificadas de un mismo modo. A pesar de que existe una considerable diferencia entre este modelo y los demás, los distintos modelos se han desenvuelto bien obteniendo una serie de resultados aceptables, donde se puede observar que para este problema los modelos que hacen uso de la aleatoriedad y estadística, como son en este caso **Random Forest** y **Red Neuronal Artificial** (recordemos que se ha diseñado una red sencilla sin pesos ajustados, ya que conlleva un mayor desarrollo del problema). Por último los modelos que hacen uso o bien de la probabilidad estadística o de la estadística meramente obtienen unos buenos resultados.
+
+## Preguntas y respuestas
+
+* **¿Qué se recomendaría a un vendedor para hacer que sus subastas tengan más probabilidad de ser competitivas?**
+
+Realmente lo ideal sería ver ejemplos dentro de su mismo sector y realizar subastas similares, ya que como se puede observar con el algoritmo **KNN**, subastas con características similares obtendrán resultados similares, por lo que dentro de un margen de adaptación del vendedor, lo ideal sería realizar comparativa de subastas previas.
+
+Por otro lado, se puede observar claramente que las subastas competitivas son aquellas que se cierran con un mayor precio (lo cual es lógico y no aporta información adicional), pero también lo son aquellas que empiezan con un precio de apertura inferior, probablemente por la accesibilidad que estas permiten.
+
+Por último, cabría destacar que los días donde se obtienen mejores resultados son los Lunes, seguido de los fines de semana, y los peores los Martes y Miércoles, por lo que lo ideal es hacer ofertas que acaben en fin de semana, preferiblemente Lunes.
+
+* **En función del conocimiento obtenido, ¿qué estrategias de negocio podría adoptar la empresa eBay para mejorar el resultado de las subastas?**
+
+Tras el análisis se puede observar que por norma general, los mejores vendedores no son los que obtienen los mejores resultados, sino aquellos vendedores que siendo buenos, no son los más destacados, ya que por norma general, un vendedor muy destacado tiene a ofrecer subastas con precios mayores, lo cual las hace menos competitivas. *eBay* como empresa debería potenciar este sector de forma que se alimente la competencia entre los grandes vendedores y vendedores no tan conocidos, obteniendo así una mayor competitivad de precios e igualando los diferentes sectores.
+
+Por otro lado, *eBay* debería favorecer de alguna forma el inicio de las subastas por precios reducidos, de forma que estas sean más llamativas para el cliente, y a su vez estas acaben por norma general en los días donde se realiza un mayor consumo, en el intervalo de días descrito en la anterior pregunta (fin de semana con preferencia en Lunes).

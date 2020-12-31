@@ -1,0 +1,635 @@
+---
+title: |
+  ![](C:\Users\power\Desktop\logo.jpg){width=4in}
+  
+  **Reglas de asociación**
+  \bigskip
+author: "Carlos Morales Aguilera"
+date: |
+  13/12/2020
+  \pagebreak
+  
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("readxl")
+library(arules)
+library(arulesViz)
+library(dplyr)
+library(knitr)
+set.seed(1234)
+```
+
+## Lectura de datos
+
+El primer paso en el problema es leer correctamente los datos, para ello se utiliza la función ```read_excel``` de la librería **readxl**, a continuación se transforma el conjunto de datos obtenido en una estructura del tipo **dataframe** propia de *R*.
+
+```{r}
+f <- "C:\\Users\\power\\Desktop\\TID\\Practica4\\Prestamo.xls"
+# Read dataframe
+my_description <- read_excel(f, sheet = "descripcion")
+
+bd_prestamo <- as.data.frame(read_excel(f, sheet = "datos"))
+```
+
+Una de las buenas prácticas aprendidas de las prácticas anteriores es la de eliminar valores perdidos, por lo que previamente a tratar con los datos, nos aseguramos de eliminar los posibles valores perdidos si hubieran.
+
+Por otro lado, otro de los errores comunes vistos anteriormente es que ciertos modelos no pueden trabajar con nombres de variables complejos, por lo que para ello se han analizado las columnas, y se ha decidido borrar los espacios de aquellas que poseyeran dicho carácter.
+
+```{r}
+# Omit NAs
+bd_prestamo <- na.omit(bd_prestamo)
+
+# Get column names and erase ' ' character
+cols <- colnames(bd_prestamo)
+for(i in 1:length(cols)) cols[i] <- gsub(" ", "", cols[i])
+# Set column names
+names(bd_prestamo) <- cols
+```
+
+## Preprocesamiento de los datos
+
+Para procesar los datos correctamente, lo primero es determinar la importancia de las distintas variables que se poseen en el conjunto de datos, tras ello, se ha llegado a la conclusión de que el código postal por sí solo no aporta suficiente información en este problema, por lo que queda descartado, ya que requeriría una discretización compleja basada en zonas geográficas.
+
+Por otro lado, la información sobre la conversión de los clientes tras la última campaña, no llega a ser una información que aporte más información que la ya existente, ya que se desconoce en un principio el enfoque de la campaña, y el objetivo al final es observar que características poseen en común los clientes que han contratado varios servicios, es decir, sobre los que se ha realizado una *venta cruzada*, por lo que se descarta dicha información ya que el objetivo actual es distinto, pese a intentar alcanzar el mismo objetivo final.
+
+```{r}
+# Remove unused columns
+bd_prestamo[,"ZIPCode"] <- NULL
+bd_prestamo[,"PersonalLoan"] <- NULL
+```
+
+Tras un primer análisis simple de los datos, se puede observar que los límites son coherentes, por lo que solo examinaremos posibles outliers en las variables **Income** y **Mortgage**.
+
+```{r}
+# Boxplots Income and Mortgage
+boxplot(bd_prestamo$Income, main = "Income")
+boxplot(bd_prestamo$Mortgage, main = "Mortgage")
+```
+
+Tras analizar los *outliers* obtenidos, se puede observar que son casos donde se posee una nómina o una hipoteca muy elevada, por lo que aunque no son datos atípicos, se eliminarán del estudio ya que son clientes que se pueden considerar especiales, y el enfoque de la lógica del banco debería ser distinto para dichos casos especiales.
+
+```{r}
+# Remove Income outliers
+outliers <- boxplot.stats(bd_prestamo$Income)$out
+for(i in 1:length(outliers)) 
+  bd_prestamo <- bd_prestamo[!bd_prestamo$Income == outliers[i], ]
+# Remove Mortgage outliers
+outliers <- boxplot.stats(bd_prestamo$Mortgage)$out
+for(i in 1:length(outliers)) 
+  bd_prestamo <- bd_prestamo[!bd_prestamo$Mortgage == outliers[i], ]
+```
+
+## Discretización de variables
+
+Una de las técnicas principales de preprocesamiento de datos consisten en la [discretización](http://fisicotronica.com/discretizacion-el-salto-cualitativo/#:~:text=El%20t%C3%A9rmino%20discretizaci%C3%B3n%20es%20un,y%20ecuaciones%20a%20contrapartes%20discretas.) de valores continuos, o discretización de valores categóricos como agrupación de estas categorías en otras que abarquen más categoría en una misma. Para ello se ha utilizado la función [cut](https://www.rdocumentation.org/packages/base/versions/3.6.2/topics/cut), perteneciente al paquete *base* del propio *R*.
+
+Para la realización de la discretización de las variables categóricas del problema, se han estudiado los distintos casos posibles en la información de *variables* del conjunto de datos, para ello se han tomado las siguientes decisiones:
+
+* **Age**: Se divide en tres grupos según el rango.
+  * *Joven* (0): 20-39 años.
+  * *Medio* (1): 40-49 años.
+  * *Mayor* (2): 50-70 años.
+* **Experience**: Se divide en categorías según la experiencia profesional.
+  * *Sin experiencia* (0): 0 años.
+  * *Junior* (1): 1-9 años.
+  * *Senior* (2): 10-24 años.
+  * *Experto* (3): 25-45 años.
+* **Income**: Se clasifica según rangos salariales, para distinguir los diferentes casos.
+  * *Bajo* (0): 8-19 mil &euro;.
+  * *Medio-bajo* (1): 20-49 mil &euro;.
+  * *Medio-alto* (2): 50-99 mil &euro;.
+  * *Alto* (3): 100-185 mil &euro;.
+* **CCAvg**: Se divide de forma equitativa en tres grupos.
+  * *Sin gastos* (0): 0.
+  * *Gastos comunes* (1): 0.1-2.9 mil &euro;.
+  * *Gastos medios* (2): 3.0-5.9 mil &euro;.
+  * *Gastos altos* (3): 6.0-10.0 mil &euro;.
+* **Mortgage**: Se divide según rangos, para tener en cuenta las diferencias de hipotecas pendientes.
+  * *Sin hipoteca* (0): 0 &euro;.
+  * *Baja* (1): 1-49 mil &euro;.
+  * *Media* (2): 50-99 mil &euro;.
+  * *Alta* (3): 100-250 mil &euro;.
+
+```{r}
+# Discretize Age by range (Young, Adult, Old)
+bd_prestamo[,"Age"] <- cut(bd_prestamo[,"Age"], 
+                           breaks = c(20,40,50,70), 
+                           labels = c(0, 1, 2), right = FALSE)
+# Discretize Experience by range (No experience, Junior, Senior, Expert)
+bd_prestamo[,"Experience"] <- cut(bd_prestamo[,"Experience"], 
+                                  breaks = c(0, 1, 10, 25, 45), 
+                                  labels = c(0, 1, 2, 3), right = FALSE)
+# Discretize Income by range (Low, Medium-low, Medium-high, High)
+bd_prestamo[,"Income"] <- cut(bd_prestamo[,"Income"], 
+                              breaks = c(8, 20, 50, 100, 186), 
+                              labels = c(0, 1, 2, 3), right = FALSE)
+# Discretize CCAvg by range (No spending, Low, Medium, High)
+bd_prestamo[,"CCAvg"] <- cut(bd_prestamo[,"CCAvg"], 
+                             breaks = c(0, 0.1, 3.0, 6.0, 10.0), 
+                             labels = c(0, 1, 2, 3), right = FALSE)
+# Discretize Mortgage by range (Low, Medium-low, Medium-high, High)
+bd_prestamo[,"Mortgage"] <- cut(bd_prestamo[,"Mortgage"],
+                                breaks = c(0, 1, 50, 100, 251), 
+                                labels = c(0, 1, 2, 3), right = FALSE)
+
+# Omit NAs
+bd_prestamo <- na.omit(bd_prestamo)
+```
+
+Por último, antes del tratamiento, se trasladan los valores numéricos a factores para su posterior procesamiento.
+
+```{r}
+# Convert into factors
+bd_prestamo[, "Family"] <- as.factor(bd_prestamo[, "Family"])
+bd_prestamo[, "Education"] <- as.factor(bd_prestamo[, "Education"])
+```
+
+## Planteamiento del problema
+
+Para poder examinar las posibles ventas cruzadas, se ha decidido evaluar todas las posibilidades de venta cruzada entre dos productos:
+
+* Cuentas de valores (*Securities Accounts*) y Certificados de depósitos (*CD Accounts*).
+* Cuentas de valores (*Securities Accounts*) y Servicios de banca en línea (*Online*).
+* Cuentas de valores (*Securities Accounts*) y Tarjetas de crédito (*Credit Card*).
+* Certificados de depósitos (*CD Accounts*) y Servicios de banca en línea (*Online*).
+* Certificados de depósitos (*CD Accounts*) y Tarjetas de crédito (*Credit Card*).
+* Servicios de banca en línea (*Online*) y Tarjetas de crédito (*Credit Card*).
+
+Para ello se ha decidido unificar la información en las siguientes columnas:
+
+* *Securities_CD* si *Securities Accounts* y *CD Accounts* son igual 1, entonces será 1, si una de las dos no lo es, entonces será 0.
+* *Securities_Online* si *Securities Accounts* y *Online* son igual 1, entonces será 1, si una de las dos no lo es, entonces será 0.
+* *Securities_CreditCard* si *Securities Accounts* y *Credit Card* son igual 1, entonces será 1, si una de las dos no lo es, entonces será 0.
+* *CD_Online* si *CD Accounts* y *Online* son igual 1, entonces será 1, si una de las dos no lo es, entonces será 0.
+* *CD_CreditCard* si *CD Accounts* y *Credit Card* son igual 1, entonces será 1, si una de las dos no lo es, entonces será 0.
+* *Online_CreditCard* si *Online* y *Credit Card* son igual 1, entonces será 1, si una de las dos no lo es, entonces será 0.
+
+Para realizar dicha funcionalidad sin repetir demasiado código, se ha decidido implementar la función **get_dataframe**, que dependiendo de la columna indicada añade determinada información al dataset.
+
+```{r}
+# Definition of min_max normalization function
+get_dataframe <- function(x, data) {
+  data_ready <- data
+  
+  if(x == 1){
+    data_ready <- mutate(data_ready, Securities_CD = SecuritiesAccount + CDAccount)
+    data_ready[, "Securities_CD"] <- ifelse(
+      data_ready[, "Securities_CD"] == 2, 1, 0)
+    data_ready[, "Securities_CD"] <- as.factor(
+      data_ready[, "Securities_CD"])
+  }else if(x == 2){
+    data_ready <- mutate(data_ready, Securities_Online = SecuritiesAccount + Online)
+    data_ready[, "Securities_Online"] <- ifelse(
+      data_ready[, "Securities_Online"] == 2, 1, 0)
+    data_ready[, "Securities_Online"] <- as.factor(
+      data_ready[, "Securities_Online"])
+  }else if(x == 3){
+    data_ready <- mutate(data_ready, Securities_CreditCard = SecuritiesAccount + CreditCard)
+    data_ready[, "Securities_CreditCard"] <- ifelse(
+      data_ready[, "Securities_CreditCard"] == 2, 1, 0)
+    data_ready[, "Securities_CreditCard"] <- as.factor(
+      data_ready[, "Securities_CreditCard"])
+  }else if(x == 4){
+    data_ready <- mutate(data_ready, CD_Online = CDAccount + Online)
+    data_ready[, "CD_Online"] <- ifelse(
+      data_ready[, "CD_Online"] == 2, 1, 0)
+    data_ready[, "CD_Online"] <- as.factor(
+      data_ready[, "CD_Online"])
+  }else if(x == 5){
+    data_ready <- mutate(data_ready, CD_CreditCard = CDAccount + CreditCard)
+    data_ready[, "CD_CreditCard"] <- ifelse(
+      data_ready[, "CD_CreditCard"] == 2, 1, 0)
+    data_ready[, "CD_CreditCard"] <- as.factor(
+      data_ready[, "CD_CreditCard"])
+  }else if(x == 6){
+    data_ready <- mutate(data_ready, Online_CreditCard = Online + CreditCard)
+    data_ready[, "Online_CreditCard"] <- ifelse(
+      data_ready[, "Online_CreditCard"] == 2, 1, 0)
+    data_ready[, "Online_CreditCard"] <- as.factor(
+      data_ready[, "Online_CreditCard"])
+  }
+  
+  data_ready[, "SecuritiesAccount"] <- NULL
+  data_ready[, "CDAccount"] <- NULL
+  data_ready[, "Online"] <- NULL
+  data_ready[, "CreditCard"] <- NULL
+  
+  data_ready
+}
+```
+
+Además, se han definido dos funciones para calcular el soporte y la confianza de los items que contengan las variables de venta cruzada anteriormente mencionadas, con el objetivo de ver la representatividad de estos casos en el conjunto total.
+
+```{r}
+get_support <- function(x, data){
+  if(x == 1){
+    result <- ifelse(data[,"SecuritiesAccount"] == 1 
+                     | data[,"CDAccount"] == 1, 1, 0)
+  }else if(x == 2){
+    result <- ifelse(data[,"SecuritiesAccount"] == 1 
+                     | data[,"Online"] == 1, 1, 0)
+  }else if(x == 3){
+    result <- ifelse(data[,"SecuritiesAccount"] == 1 
+                     | data[,"CreditCard"] == 1, 1, 0)
+  }else if(x == 4){
+    result <- ifelse(data[,"CDAccount"] == 1 
+                     | data[,"Online"] == 1, 1, 0)
+  }else if(x == 5){
+    result <- ifelse(data[,"CDAccount"] == 1 
+                     | data[,"CreditCard"] == 1, 1, 0)
+  }else if(x == 6){
+    result <- ifelse(data[,"Online"] == 1 
+                     | data[,"CreditCard"] == 1, 1, 0)
+  }else if(x == 0){
+    result <- ifelse(bd_prestamo[, "SecuritiesAccount"] == 1 
+                     | bd_prestamo[, "CDAccount"] == 1 
+                     | bd_prestamo[, "Online"] == 1 
+                     | bd_prestamo[, "CreditCard"] == 1, 1, 0)
+  }
+
+  as.integer(table(result)[2])/nrow(data)
+}
+
+get_confidence <- function(x, data){
+  if(x == 1){
+    result <- ifelse(data[,"SecuritiesAccount"] == 1 
+                     & data[,"CDAccount"] == 1, 1, 0)
+  }else if(x == 2){
+    result <- ifelse(data[,"SecuritiesAccount"] == 1 
+                     & data[,"Online"] == 1, 1, 0)
+  }else if(x == 3){
+    result <- ifelse(data[,"SecuritiesAccount"] == 1 
+                     & data[,"CreditCard"] == 1, 1, 0)
+  }else if(x == 4){
+    result <- ifelse(data[,"CDAccount"] == 1 
+                     & data[,"Online"] == 1, 1, 0)
+  }else if(x == 5){
+    result <- ifelse(data[,"CDAccount"] == 1 
+                     & data[,"CreditCard"] == 1, 1, 0)
+  }else if(x == 6){
+    result <- ifelse(data[,"Online"] == 1 
+                     & data[,"CreditCard"] == 1, 1, 0)
+  }else if(x == 0){
+    result <- ifelse(bd_prestamo[, "SecuritiesAccount"] == 1
+                     & bd_prestamo[, "CDAccount"] == 1 
+                     & bd_prestamo[, "Online"] == 1 
+                     & bd_prestamo[, "CreditCard"] == 1, 1, 0)
+  }
+
+  as.integer(table(result)[2])/nrow(data)
+}
+```
+
+
+A continuación se procede a observar el soporte y la confianza de los casos a estudiar para examinar la venta cruzada y determinar unas reglas de asociación.
+
+```{r}
+# Support of Securities Accounts and CD Accounts
+sp1 <- paste(get_support(1, bd_prestamo), '%')
+# Confidence of Securities Accounts and CD Accounts
+cf1 <- paste(get_confidence(1, bd_prestamo), '%')
+name1 <- '{Securities Accounts, CD Accounts}'
+
+# Support of Securities Accounts and Online
+sp2 <- paste(get_support(2, bd_prestamo), '%')
+# Confidence of Securities Accounts and Online
+cf2 <- paste(get_confidence(2, bd_prestamo), '%')
+name2 <- '{Securities Accounts, Online}'
+
+# Support of Securities Accounts and Credit Card
+sp3 <- paste(get_support(3, bd_prestamo), '%')
+# Confidence of Securities Accounts and Credit Card
+cf3 <- paste(get_confidence(3, bd_prestamo), '%')
+name3 <- '{Securities Accounts, Credit Card}'
+
+# Support of CD Accounts and Online
+sp4 <- paste(get_support(4, bd_prestamo), '%')
+# Confidence of CD Accounts and Online
+cf4 <- paste(get_confidence(4, bd_prestamo), '%')
+name4 <- '{CD Accounts, Online}'
+
+# Support of CD Accounts and Credit Card
+sp5 <- paste(get_support(5, bd_prestamo), '%')
+# Confidence of CD Accounts and Credit Card
+cf5 <- paste(get_confidence(5, bd_prestamo), '%')
+name5 <- '{CD Accounts, Credit Card}'
+
+# Support of Online and Credit Card
+sp6 <- paste(get_support(6, bd_prestamo), '%')
+# Confidence of Online and Credit Card
+cf6 <- paste(get_confidence(6, bd_prestamo), '%')
+name6 <- '{Online, Credit Card}'
+
+# Create vectors of support, confidence and item names
+support_vector = c(sp1, sp2, sp3, sp4, sp5, sp6)
+confidence_vector = c(cf1, cf2, cf3, cf4, cf5, cf6)
+name_vector = c(name1, name2, name3, name4, name5, name6)
+
+# Create dataframe of support
+support_df = data.frame(name_vector, support_vector)
+names(support_df) <- c('Item', 'Soporte')
+
+# Create dataframe of confidence
+confidence_df = data.frame(name_vector, confidence_vector)
+names(confidence_df) <- c('Item', 'Confianza')
+
+# Print support dataframe
+kable(support_df)
+
+# Print confidence dataframe
+kable(confidence_df)
+```
+
+Tal y como se puede observar, el número de casos en los que se realiza alguna venta cruzada es de aproximidamente el *6,44%* de los casos totales, por lo que a continuación procedemos a ver el soporte y la confianza del item que contiene todos los productos.
+
+```{r}
+# Support of All Services
+per1 <- paste(get_support(0, bd_prestamo), '%')
+# Confidence of All Services
+per2 <- paste(get_confidence(0, bd_prestamo), '%')
+
+# Create vector of percentages
+percent_vector <- c(per1, per2)
+
+# Create dataframe
+total_df <- data.frame(c('Soporte', 'Confianza'), percent_vector)
+names(total_df) <- c('Característica', 'Porcentaje')
+
+# Print dataframe
+kable(total_df)
+```
+
+Se puede observar que tan sólo en el *1,6%* de los casos se realiza una venta cruzada que contenga todos los productos evaluados, teniendo esta un soporte del *74,4%*, es decir, un *74,4%* de los clientes obtienen algún producto, pero para nuestro objetivo, nos interesan únicamente los casos donde se realiza la venta cruzada y ver las relaciones entre dichos clientes, para ello se restringiran posteriormente los resultados obtenidos.
+
+## Generación de reglas
+
+El algoritmo escogido para la generación de reglas es el de [Apriori](https://en.wikipedia.org/wiki/Apriori_algorithm), el cual se ha implementado utilizando el paquete [arules](https://cran.r-project.org/web/packages/arules/index.html), y utilizando la función [apriori](https://www.rdocumentation.org/packages/arules/versions/1.6-6/topics/apriori).
+
+Además, se ha utilizado también la función [itemFrequencyPlot](https://www.rdocumentation.org/packages/arules/versions/1.6-6/topics/itemFrequencyPlot), que permite ver en un histograma la frecuencia de un item, y la función [interestMeasure](https://www.rdocumentation.org/packages/arules/versions/1.6-6/topics/interestMeasure), que permite obtener tanto el *coverage* como el valor de la [Prueba exacta de Fisher](https://es.wikipedia.org/wiki/Prueba_exacta_de_Fisher)
+
+Por último, para visualizar las gráficas se ha utilizado el paquete [arulesViz](https://cran.r-project.org/web/packages/arulesViz/index.html), que contiene los métodos para poder visualizar gráficamente las diferentes reglas, los modelos que se han escogido son *Scatter plot*, *Graph plot* y *Parallel coordinates plot*.
+
+### Securities Accounts y CD Account
+
+```{r}
+# Create dataframe using function
+bd_prestamo_1 <- get_dataframe(1, bd_prestamo)
+# Transform dataframe into transactions
+bd_prestamo_1 <- as(bd_prestamo_1,"transactions")
+
+# Plot item frequency
+itemFrequencyPlot(bd_prestamo_1,support=0.1)
+
+# Generate rules
+rules <- apriori(bd_prestamo_1,
+                 parameter = list(supp=0.01, conf=0.02, target="rules"),
+                 appearance = list(rhs=c("Securities_CD=1"),
+                                   default="lhs"),
+                 control = list(verbose=F))
+
+# Sort rules
+rules.sorted <- sort(rules, by="lift")
+# Inspect sorted rules
+inspect(rules.sorted)
+
+# Coverage and Fishers Exact Test
+interestMeasure(rules, measure = c("coverage", "fishersExactTest"),
+                            transactions = bd_prestamo_1)
+
+# Scatter plot
+plot(rules)
+
+# Graph plot
+plot(rules, method="graph")
+
+# Parallel coordinates plot
+plot(rules, method="paracoord", control=list(reorder=TRUE))
+```
+
+### Securities Accounts y Online
+
+```{r}
+# Create dataframe using function
+bd_prestamo_2 <- get_dataframe(2, bd_prestamo)
+# Transform dataframe into transactions
+bd_prestamo_2 <- as(bd_prestamo_2,"transactions")
+
+# Plot item frequency
+itemFrequencyPlot(bd_prestamo_2,support=0.1)
+
+# Generate rules
+rules <- apriori(bd_prestamo_2,
+                 parameter = list(supp=0.02, conf=0.063, target="rules"),
+                 appearance = list(rhs=c("Securities_Online=1"),
+                                   default="lhs"),
+                 control = list(verbose=F))
+
+# Sort rules
+rules.sorted <- sort(rules, by="lift")
+# Inspect sorted rules
+inspect(rules.sorted)
+
+# Coverage and Fishers Exact Test
+interestMeasure(rules, measure = c("coverage", "fishersExactTest"),
+                            transactions = bd_prestamo_2)
+
+# Scatter plot
+plot(rules)
+
+# Graph plot
+plot(rules, method="graph")
+
+# Parallel coordinates plot
+plot(rules, method="paracoord", control=list(reorder=TRUE))
+```
+
+### Securities Accounts y Credit Card
+
+```{r}
+# Create dataframe using function
+bd_prestamo_3 <- get_dataframe(3, bd_prestamo)
+# Transform dataframe into transactions
+bd_prestamo_3 <- as(bd_prestamo_3,"transactions")
+
+# Plot item frequency
+itemFrequencyPlot(bd_prestamo_3,support=0.1)
+
+# Generate rules
+rules <- apriori(bd_prestamo_3,
+                 parameter = list(supp=0.01, conf=0.025, target="rules"),
+                 appearance = list(rhs=c("Securities_CreditCard=1"),
+                                   default="lhs"),
+                 control = list(verbose=F))
+
+# Sort rules
+rules.sorted <- sort(rules, by="lift")
+# Inspect sorted rules
+inspect(rules.sorted)
+
+# Coverage and Fishers Exact Test
+interestMeasure(rules, measure = c("coverage", "fishersExactTest"),
+                            transactions = bd_prestamo_3)
+
+# Scatter plot
+plot(rules)
+
+# Graph plot
+plot(rules, method="graph")
+
+# Parallel coordinates plot
+plot(rules, method="paracoord", control=list(reorder=TRUE))
+```
+
+### CD Account y Online
+
+```{r}
+# Create dataframe using function
+bd_prestamo_4 <- get_dataframe(4, bd_prestamo)
+# Transform dataframe into transactions
+bd_prestamo_4 <- as(bd_prestamo_4,"transactions")
+
+# Plot item frequency
+itemFrequencyPlot(bd_prestamo_4,support=0.1)
+
+# Generate rules
+rules <- apriori(bd_prestamo_4,
+                 parameter = list(supp=0.01, conf=0.06, target="rules"),
+                 appearance = list(rhs=c("CD_Online=1"),
+                                   default="lhs"),
+                 control = list(verbose=F))
+
+# Sort rules
+rules.sorted <- sort(rules, by="lift")
+# Inspect sorted rules
+inspect(rules.sorted)
+
+# Coverage and Fishers Exact Test
+interestMeasure(rules, measure = c("coverage", "fishersExactTest"),
+                            transactions = bd_prestamo_4)
+
+# Scatter plot
+plot(rules)
+
+# Graph plot
+plot(rules, method="graph")
+
+# Parallel coordinates plot
+plot(rules, method="paracoord", control=list(reorder=TRUE))
+```
+
+### CD Account y Credit Card
+
+```{r}
+# Create dataframe using function
+bd_prestamo_5 <- get_dataframe(5, bd_prestamo)
+# Transform dataframe into transactions
+bd_prestamo_5 <- as(bd_prestamo_5,"transactions")
+
+# Plot item frequency
+itemFrequencyPlot(bd_prestamo_5,support=0.1)
+
+# Generate rules
+rules <- apriori(bd_prestamo_5,
+                 parameter = list(supp=0.01, conf=0.05, target="rules"),
+                 appearance = list(rhs=c("CD_CreditCard=1"),
+                                   default="lhs"),
+                 control = list(verbose=F))
+
+# Sort rules
+rules.sorted <- sort(rules, by="lift")
+# Inspect sorted rules
+inspect(rules.sorted)
+
+# Coverage and Fishers Exact Test
+interestMeasure(rules, measure = c("coverage", "fishersExactTest"),
+                            transactions = bd_prestamo_5)
+
+# Scatter plot
+plot(rules)
+
+# Graph plot
+plot(rules, method="graph")
+
+# Parallel coordinates plot
+plot(rules, method="paracoord", control=list(reorder=TRUE))
+```
+
+### Online y Credit Card
+
+```{r}
+# Create dataframe using function
+bd_prestamo_6 <- get_dataframe(6, bd_prestamo)
+# Transform dataframe into transactions
+bd_prestamo_6 <- as(bd_prestamo_6,"transactions")
+
+# Plot item frequency
+itemFrequencyPlot(bd_prestamo_6,support=0.1)
+
+# Generate rules
+rules <- apriori(bd_prestamo_6,
+                 parameter = list(supp=0.02, conf=0.2, target="rules"),
+                 appearance = list(rhs=c("Online_CreditCard=1"),
+                                   default="lhs"),
+                 control = list(verbose=F))
+
+# Sort rules
+rules.sorted <- sort(rules, by="lift")
+# Inspect sorted rules
+inspect(rules.sorted)
+
+# Coverage and Fishers Exact Test
+interestMeasure(rules, measure = c("coverage", "fishersExactTest"),
+                            transactions = bd_prestamo_6)
+
+# Scatter plot
+plot(rules)
+
+# Graph plot
+plot(rules, method="graph")
+
+# Parallel coordinates plot
+plot(rules, method="paracoord", control=list(reorder=TRUE))
+```
+
+## Tabla de resultados
+
+| Servicio                                        | Edad       | Exp. laboral | Educación               | Ingresos          | Media gasto con Tarjeta | Fam. | Hipoteca |
+|-------------------------------------------------|------------|--------------|-------------------------|-------------------|-------------------------|------|----------|
+| Cuentas de valores y Certificados de depósitos  | 50-70 años | 25-45 años   | Sin graduado            | *¿?*              | *¿?*                    | *¿?* | 0 &euro;  |
+| Cuentas de valores y Banca en línea             | 50-70 años | 25-45 años   | Sin graduado - Graduado | 20-49 mil &euro;   | 0.1-2.9 mil &euro;       | *¿?* | 0 &euro;  |
+| Cuentas de valores y Tarjetas de crédito        | 50-70 años | 25-45 años   | Sin graduado            | *¿?*              | 0.1-2.9 mil &euro;       | *¿?* | 0 &euro;  |
+| Certificados de depósitos y Banca en línea      | 40-49 años | 10-24 años   | Sin graduado            | 100-185 mil &euro; | 3.0-5.9 mil &euro;       | 3    | 0 &euro;  |
+| Certificados de depósitos y Tarjetas de crédito | 40-49 años | 10-24 años   | *¿?*                    | 100-185 mil &euro; | 3.0-5.9 mil &euro;       | 3    | 0 &euro;  |
+| Banca en línea y Tarjetas de crédito            | 20-39 años | 10-24 años   | Sin graduado            | 20-49 mil &euro;   | 0.1-2.9 mil &euro;       | 4    | 0 &euro;  |
+
+## Conclusiones
+
+Tras realizar la generación de reglas y analizar los reglas obtenidas, se ha realizado un análisis en el que se llegan a las siguientes conclusiones:
+
+* Los factores más comunes encontrados son los siguientes:
+  * Clientes que no se han graduado.
+  * Clientes que no poseen hipoteca.
+
+* Los factores que se consideran menos son los siguientes:
+  * Integrantes de la familia del miembro.
+  * Clientes con hipoteca.
+  * Clientes con graduado.
+  
+* Para enfocar la campaña de cara a realizar una venta cruzada, habría que considerar los siguientes perfiles:
+  * *Cuentas de valores* y *Certificados de depósitos*: Se busca un perfil de una persona mayor, con bastante experiencia laboral.
+  * *Cuentas de valores* y *Banca en línea*: Se busca un perfil de una persona mayor, con bastante experiencia laboral, y con un salario medio, pero con pocos gastos a través de la tarjeta de crédito, por lo que se entiende que es un perfil que compra lo necesario.
+  * *Cuentas de valores* y *Tarjetas de créditos*: Se busca un perfil de una persona mayor, con bastante experiencia laboral, con pocos gastos a través de tarjeta de crédito.
+  * *Certificados de depósitos* y *Banca en línea*: Se busca un perfil de un adulto, con una considerable experiencia laboral y con una renta alta, que además realice unos gastos considerables.
+  * *Certificados de depósitos* y *Tarjeta de crédito*: Se busca un perfil de un adulto, con una considerable experiencia laboral y con una renta alta, que además realice unos gastos considerables. Por media el número de integrantes de su familia es de 3 miembros.
+  * *Banca en línea* y *Tarjeta de crédito*: Se busca un perfil de un adulto joven, con una considerable experiencia laboral y con una renta baja, y por lo tanto unos gastos bajos, con familia normalmente de 4 integrantes.
+  
+Una vez consideradas las anteriores anotaciones, se llega a la conclusión de que la campaña a realizar debe enfocarse principalmente en perfiles de clientes sin hipoteca y que no se hayan graduado, y teniendo en cuenta toda la información obtenida se propone una campaña que siga las siguientes instrucciones:
+
+* Ofrecer una promoción que consista en vender servicios de *Cuentas de valores*, junto con *Banca en línea* o *Tarjetas de crédito*, aunque pudieran ofertarse los tres en conjunto, a clientes que sean personas mayores, premiando aquellos que no realizan grandes gastos mediante la tarjeta de crédito y con una renta baja o media.
+* Ofrecer una promoción que consista en vender servicios de *Certificados de depósitos*, junto con *Banca en línea* y *Tarjetas de crédito* a clientes adultos con una alta renta y que realicen unos gastos considerables.
+* Ofrecer una promoción que consista en vender servicios de *Banca en línea* y *Tarjetas de crédito* a clientes jóvenes, que tengan una renta considerable y con un gasto bajo, priorizando aquellos que posean familias más numerosas.
+* Ofrecer una promoción que consista en vender servicios de *Cuentas de valores* y *Certificados de depósitos* a clientes mayores, que basándonos en experiencias previas, no posean una renta alta y realicen pocos gastos.
